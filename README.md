@@ -6,6 +6,7 @@ Installing dependencies.
 python3 -m virtualenv env
 source env/bin/activate
 pip install -r requirements.txt
+python -m spacy download en
 ```
 If you encounter problems with installation, look at [TextWorld](https://github.com/Microsoft/TextWorld).
 
