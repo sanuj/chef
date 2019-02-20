@@ -15,7 +15,7 @@ general:
   epsilon_anneal_to: 0.2
 
 checkpoint:
-  experiment_tag: 'name_your_current_experiment_here'
+  experiment_tag: 'base-train-0'
   model_checkpoint_path: 'saved_models'
   load_pretrained: False  # during test, enable this so that the agent load your pretrained model
   pretrained_experiment_tag: 'name_of_your_previous_experiemnt_episode_k'
