@@ -8,6 +8,8 @@ from textworld import EnvInfos
 
 from custom_agent import CustomAgent
 
+import visdom
+
 # List of additional information available during evaluation.
 AVAILABLE_INFORMATION = EnvInfos(
     description=True, inventory=True,
@@ -30,7 +32,8 @@ def _validate_requested_infos(infos: EnvInfos):
 
 
 def train(game_files):
-
+    viz = visdom.Visdom()
+    win = None
     agent = CustomAgent()
     requested_infos = agent.select_additional_infos()
     _validate_requested_infos(requested_infos)
@@ -68,6 +71,10 @@ def train(game_files):
         score = sum(stats["scores"]) / agent.batch_size
         steps = sum(stats["steps"]) / agent.batch_size
         print("Epoch: {:3d} | {:2.1f} pts | {:4.1f} steps".format(epoch_no, score, steps))
+        if win:
+            viz.line(Y=[[score, steps]], X=[epoch_no], win=win, update='append')
+        else:
+            win = viz.line(Y=[[score, steps]], X=[epoch_no], opts=dict(showlegend=True, legend=['score', 'steps'], xlabel='epoch'))
 
 
 if __name__ == '__main__':
