@@ -76,6 +76,8 @@ def train(game_files):
         else:
             win = viz.line(Y=[[score, steps]], X=[epoch_no], opts=dict(showlegend=True, legend=['score', 'steps'], xlabel='epoch'))
 
+    viz.save(viz.get_env_list())
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train an agent.")
