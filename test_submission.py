@@ -277,7 +277,7 @@ def _dockerize(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate an agent.")
-    parser.add_argument("--in-docker", action="store_true", default=False, help=argparse.SUPPRESS)
+    parser.add_argument("--in-docker", action="store_true", default=True, help=argparse.SUPPRESS)
     parser.add_argument("submission_dir")
     parser.add_argument("games_dir")
     parser.add_argument("output", nargs='?', default="stats.json")
