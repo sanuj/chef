@@ -33,9 +33,11 @@ def _validate_requested_infos(infos: EnvInfos):
             raise ValueError(msg.format(key))
 
 
-def train(game_files):
-    viz = visdom.Visdom()
-    win = None
+def train(game_files, visualize):
+    if visualize:
+        viz = visdom.Visdom()
+        win = None
+
     agent = CustomAgent()
     requested_infos = agent.select_additional_infos()
     _validate_requested_infos(requested_infos)
@@ -73,18 +75,19 @@ def train(game_files):
         score = sum(stats["scores"]) / agent.batch_size
         steps = sum(stats["steps"]) / agent.batch_size
         print("Epoch: {:3d} | {:2.1f} pts | {:4.1f} steps".format(epoch_no, score, steps))
-        if win:
-            viz.line(Y=[[score, steps]], X=[epoch_no], win=win, update='append')
-        else:
-            win = viz.line(Y=[[score, steps]], X=[epoch_no], opts=dict(showlegend=True, legend=['score', 'steps'], xlabel='epoch'))
-
-        viz.save(viz.get_env_list())
+        if visualize:
+            if win:
+                viz.line(Y=[[score, steps]], X=[epoch_no], win=win, update='append')
+            else:
+                win = viz.line(Y=[[score, steps]], X=[epoch_no], opts=dict(showlegend=True, legend=['score', 'steps'], xlabel='epoch'))
+            viz.save(viz.get_env_list())
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train an agent.")
     parser.add_argument("games", metavar="game", nargs="+",
                        help="List of games (or folders containing games) to use for training.")
+    parser.add_argument("--visualize", action="store_true")
     args = parser.parse_args()
 
     games = []
@@ -95,4 +98,4 @@ if __name__ == '__main__':
             games.append(game)
 
     print("{} games found for training.".format(len(games)))
-    train(games)
+    train(games, args.visualize)
