@@ -6,3 +6,5 @@ textworld
 spacy
 torch
 visdom
+pytorch-pretrained-bert
+
