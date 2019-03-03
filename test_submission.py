@@ -2,6 +2,8 @@
 
 import argparse
 import docker
+import flask
+import functools
 import glob
 import gym
 import json
@@ -13,13 +15,16 @@ import sys
 import tempfile
 import textworld
 import textworld.gym
+import threading
 import time
 import tqdm
+import urllib
 
 
 NB_EPISODES = 10
 MAX_EPISODE_STEPS = 100
-TIMEOUT = 12 * 30 * 60  # 12 hours
+TIMEOUT = 6 * 3600  # 6 hours
+PORT = 29592
 
 # List of additional information available during evaluation.
 AVAILABLE_INFORMATION = textworld.EnvInfos(
@@ -43,56 +48,146 @@ def _validate_requested_infos(infos):
             raise ValueError(msg.format(key))
 
 
-class _ReplayAgent:
+def _serialize_infos(infos):
+    result = {}
+    for slot in infos.__slots__:
+        result[slot] = getattr(infos, slot)
+    return result
+
+
+class _RemoteAgent:
     """
-    An agent that replays the actions of another agent.
+    An agent that forwards to a remote agent in another process.
     """
 
-    def __init__(self, stats):
-        self._stats = stats
-        self._game = None
-        self._episode = 0
-        self._step = 0
+    def __init__(self, host="localhost", port=PORT):
+        self._host = host
+        self._port = port
+
+    def _send(self, command, *args):
+        url = "http://{}:{}/agents/{}/{}".format(self._host, self._port, self._game_id, command)
+        args = json.dumps(args).encode("utf-8")
+        request = urllib.request.Request(url, args)
+        try:
+            result = urllib.request.urlopen(request).read()
+        except urllib.error.HTTPError:
+            raise ValueError("Some errors occurred when evaluating the agent. You can test your agent"
+                " using the `test_submission.py` script provided with the starting kit"
+                " and using the `--debug` flag."
+                " If you can't find your error, reach out to us: textworld@microsoft.com.") \
+                from None
+
+        return json.loads(result)
 
     def train(self):
-        pass
+        self._send("train")
 
     def eval(self):
-        pass
+        self._send("eval")
 
     def select_additional_infos(self):
-        infos = textworld.EnvInfos()
-        for info in self._stats["requested_infos"]:
-            if info in AVAILABLE_INFORMATION.extras:
-                infos.extras.append(info)
-            else:
-                setattr(infos, info, True)
-        return infos
+        return textworld.EnvInfos(**self._send("select_additional_infos"))
 
     def act(self, obs, scores, dones, infos):
-        if all(dones):
-            self._episode += 1
-            self._step = 0
-            return
+        return self._send("act", obs, scores, dones, infos)
 
-        if infos["_name"] != self._game:
-            self._game = infos["_name"]
-            self._episode = 0
-
-        step = self._step
-        self._step += 1
-
-        command = self._stats["games"][self._game]["runs"][self._episode]["commands"][step]
-        return [command]
+    def close(self):
+        return self._send("stop")
 
 
-def _play_game(agent_class, agent_class_args, gamefile):
+class _AgentProcess:
+    """
+    An agent that lives in a remote process.
+    """
+
+    def __init__(self, agent_class):
+        # We rely on getting EOFError from pipes for the remote agent, so we
+        # can't have multiprocessing use the fork start method, since the forked
+        # processes will inherit the pipes without closing them
+        ctx = multiprocessing.get_context("forkserver")
+
+        self._parent_conn, self._child_conn = ctx.Pipe()
+
+        args = (agent_class, self._child_conn, self._parent_conn)
+        self._process = ctx.Process(target=self._run, args=args)
+
+        self._process.start()
+        self._child_conn.close()
+
+    @staticmethod
+    def _run(agent_class, conn, parent_conn):
+        parent_conn.close()
+
+        agent = agent_class()
+        try:
+            while True:
+                try:
+                    command, args = conn.recv()
+                except EOFError:
+                    break
+                result = getattr(agent, command)(*args)
+                conn.send(result)
+        finally:
+            conn.close()
+
+    def call(self, command, args):
+        self._parent_conn.send((command, args))
+        return self._parent_conn.recv()
+
+    def stop(self):
+        self._parent_conn.close()
+        self._process.join()
+
+
+def _serve(agent_class, args):
+    """
+    Start a web server that delegates requests to the custom agent.
+    """
+
+    app = flask.Flask("TextWorld")
+
+    agents = {}
+    lock = threading.Lock()
+
+    def _get_agent(game_id):
+        with lock:
+            agent = agents.get(game_id)
+            if agent is None:
+                agent = _AgentProcess(agent_class)
+                agents[game_id] = agent
+            return agent
+
+    @app.route("/agents/<game_id>/<command>", methods=["POST"])
+    def _call(game_id, command):
+        args = flask.request.get_json(force=True)
+        result = _get_agent(game_id).call(command, args)
+        if command == "select_additional_infos":
+            result = _serialize_infos(result)
+        return json.dumps(result)
+
+    @app.route("/agents/<game_id>/stop", methods=["POST"])
+    def _stop_agent(game_id):
+        with lock:
+            agent = agents.pop(game_id, None)
+        if agent is not None:
+            agent.stop()
+        return json.dumps(None)
+
+    @app.route("/stop")
+    def _stop():
+        flask.request.environ.get("werkzeug.server.shutdown")()
+        return ""
+
+    app.run(host="0.0.0.0", port=args.listen, threaded=True)
+
+
+def _play_game(agent_class, gamefile):
     game_name = os.path.basename(gamefile)
 
-    if agent_class_args:
-        agent = agent_class(agent_class_args)
-    else:
-        agent = agent_class()
+    agent = agent_class()
+    if isinstance(agent, _RemoteAgent):
+        # HACK: tell the remote agent the game ID so it can talk to the right remote agent
+        agent._game_id = game_name
 
     agent.eval()
     requested_infos = agent.select_additional_infos()
@@ -126,10 +221,6 @@ def _play_game(agent_class, agent_class_args, gamefile):
             # Increase step counts.
             steps = [step + int(not done) for step, done in zip(steps, dones)]
 
-            # HACK to get the replay agent the current game
-            if isinstance(agent, _ReplayAgent):
-                infos["_name"] = game_name
-
             commands = agent.act(obs, scores, dones, infos)
             all_commands.append(commands)
             obs, scores, dones, infos = env.step(commands)
@@ -146,6 +237,9 @@ def _play_game(agent_class, agent_class_args, gamefile):
         stats["runs"][no_episode]["has_lost"] = infos["has_lost"][0]
 
     env.close()
+    if hasattr(agent, "close"):
+        agent.close()
+
     stats["max_scores"] = infos["max_score"][0]
     elapsed = time.time() - start_time
     stats["duration"] = elapsed
@@ -153,8 +247,8 @@ def _play_game(agent_class, agent_class_args, gamefile):
     return {game_name: stats}, requested_infos.basics + requested_infos.extras
 
 
-def evaluate(agent_class, agent_class_args, game_files, nb_processes):
-    stats = {"games": {}, "requested_infos": []}
+def _evaluate(agent_class, game_files, nb_processes):
+    stats = {"games": {}, "requested_infos": [], "game_files": game_files}
 
     print("Using {} processes.".format(nb_processes))
     desc = "Evaluating {} games".format(len(game_files))
@@ -175,8 +269,13 @@ def evaluate(agent_class, agent_class_args, game_files, nb_processes):
 
     if nb_processes > 1:
         pool = multiprocessing.Pool(nb_processes)
+        results = []
         for game_file in game_files:
-            pool.apply_async(_play_game, (agent_class, agent_class_args, game_file), callback=_assemble_results)
+            result = pool.apply_async(_play_game, (agent_class, game_file), callback=_assemble_results)
+            results.append(result)
+
+        for result in results:
+            result.get()
 
         pool.close()
         pool.join()
@@ -184,7 +283,7 @@ def evaluate(agent_class, agent_class_args, game_files, nb_processes):
 
     else:
         for game_file in game_files:
-            data = _play_game(agent_class, agent_class_args, game_file)
+            data = _play_game(agent_class, game_file)
             _assemble_results(data)
 
         pbar.close()
@@ -192,9 +291,9 @@ def evaluate(agent_class, agent_class_args, game_files, nb_processes):
     return stats
 
 
-def _run_evaluation(agent_class, args, agent_class_args=None):
+def _run_evaluation(agent_class, args):
     games = glob.glob(os.path.join(args.games_dir, "**/*.ulx"), recursive=True)
-    stats = evaluate(agent_class, agent_class_args, games, args.nb_processes)
+    stats = _evaluate(agent_class, games, args.nb_processes)
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
     if not os.path.isdir(out_dir):
@@ -212,6 +311,14 @@ def _dockerize(args):
 
     with tempfile.NamedTemporaryFile(dir=output_dir) as output_file:
         client = docker.from_env()
+
+        # If it doesn't exist already, create a docker network with no internet access
+        try:
+            client.networks.create("textworld", internal=True, check_duplicate=True)
+        except docker.errors.APIError as e:
+            # HTTP 409: Conflict, aka the network already existed
+            if e.status_code != 409:
+                raise
 
         image_path = os.path.join(submission_dir, "Dockerimage")
         if os.path.exists(image_path):
@@ -234,15 +341,22 @@ def _dockerize(args):
                 "mode": "rw",
             },
             self_file: {
-                "bind": "/usr/bin/evaluate.py",
+                "bind": "/usr/bin/ingestion.py",
                 "mode": "ro",
             },
         }
 
+        environment = {
+            "PYTHONUNBUFFERED": "1",
+            "MKL_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+        }
+
         command = [
             "python3",
-            "/usr/bin/evaluate.py",
+            "/usr/bin/ingestion.py",
             "--in-docker",
+            "--listen={}".format(PORT),
             "/usr/src/submission",
             "/usr/share/textworld-games",
             "/usr/share/textworld-stats.json",
@@ -256,34 +370,44 @@ def _dockerize(args):
             image,
             command,
             detach=True,
-            network_mode="none",
+            network="textworld",
             volumes=volumes,
-            environment=["PYTHONUNBUFFERED=1", "MKL_NUM_THREADS=1", "OMP_NUM_THREADS=1"],
+            environment=environment,
         )
 
         try:
+            # HACK: Need to wait until the container web server is up
+            time.sleep(10)
             print("Running {}...".format(image))
-            container.wait(timeout=TIMEOUT)
+            container.reload()
+            host = container.attrs["NetworkSettings"]["Networks"]["textworld"]["IPAddress"]
+            _run_evaluation(functools.partial(_RemoteAgent, host=host), args)
         finally:
-            sys.stdout.buffer.write(container.logs(stdout=True, stderr=False))
-            sys.stderr.buffer.write(container.logs(stdout=False, stderr=True))
+            container.stop()
+
+            if args.debug:
+                sys.stdout.buffer.write(container.logs(stdout=True, stderr=False))
+                sys.stderr.buffer.write(container.logs(stdout=False, stderr=True))
+
             container.remove(force=True)
 
         print("Done")
-        stats = json.load(output_file)
-
-    _run_evaluation(_ReplayAgent, args, agent_class_args=stats)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate an agent.")
-    parser.add_argument("--in-docker", action="store_true", default=True, help=argparse.SUPPRESS)
+    parser.add_argument("--in-docker", action="store_true", default=False, help=argparse.SUPPRESS)
+    parser.add_argument("--listen", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--remote", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("submission_dir")
     parser.add_argument("games_dir")
     parser.add_argument("output", nargs='?', default="stats.json")
     parser.add_argument("--nb-processes", type=int)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
+
+    if not os.path.isdir(args.games_dir):
+        parser.error("{} is not a folder.".format(args.games_dir))
 
     args.nb_processes = args.nb_processes or multiprocessing.cpu_count()
     if args.debug:
@@ -295,8 +419,14 @@ def main():
         args.output = os.path.abspath(args.output)
         os.chdir(args.submission_dir)  # Needed to load local files (e.g. vocab.txt)
         sys.path = [args.submission_dir] + sys.path  # Prepend to PYTHONPATH
+
         from custom_agent import CustomAgent
-        _run_evaluation(CustomAgent, args)
+        if args.listen is not None:
+            _serve(CustomAgent, args)
+        elif args.remote is not None:
+            _run_evaluation(functools.partial(_RemoteAgent, port=args.remote), args)
+        else:
+            _run_evaluation(CustomAgent, args)
     else:
         _dockerize(args)
 
