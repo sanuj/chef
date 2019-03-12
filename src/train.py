@@ -75,6 +75,7 @@ def train(game_files, visualize):
         score = sum(stats["scores"]) / agent.batch_size
         steps = sum(stats["steps"]) / agent.batch_size
         print("Epoch: {:3d} | {:2.1f} pts | {:4.1f} steps".format(epoch_no, score, steps))
+        print("Replay memory size: {}".format(len(agent.replay_memory)))
         if visualize:
             if win:
                 viz.line(Y=[[score, steps]], X=[epoch_no], win=win, update='append')

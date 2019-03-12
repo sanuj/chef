@@ -61,7 +61,7 @@ class BertFeatures(object):
         with torch.no_grad():
             encoder_layers, pooled_output = self.model(torch.LongTensor(inp.token_ids).to(self.device), token_type_ids=None,
                                                        attention_mask=torch.LongTensor(inp.mask).to(self.device))
-            return pooled_output
+            return pooled_output.detach().cpu()
 
 
 def convert_examples_to_features(examples, seq_length, tokenizer):

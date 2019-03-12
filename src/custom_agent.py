@@ -354,7 +354,7 @@ class CustomAgent:
 
         batched_obs = [Observation(_d, _i, _f, _pa) for (_d, _i, _f, _pa) in zip(description_id_list, inventory_id_list, feedback_id_list, prev_action_id_list)]
         bf = [torch.cat([self.bert.extract_features(o) for o in obs]) for obs in batched_obs]
-        batched_bf = torch.nn.utils.rnn.pad_sequence(bf, batch_first=True).to(self.device)
+        batched_bf = torch.nn.utils.rnn.pad_sequence(bf, batch_first=True).cpu()
 
         return batched_bf
 
@@ -471,7 +471,7 @@ class CustomAgent:
         #         bf.append(self.bert.extract_features(o))
         #     batched_bf.append(torch.cat(bf))
 
-        state_representation = self.model.representation_generator(batched_bf)
+        state_representation = self.model.representation_generator(batched_bf.to(self.device))
         word_ranks = self.model.action_scorer(state_representation)  # each element in list has batch x n_vocab size
         return word_ranks
 
