@@ -17,7 +17,7 @@ general:
 checkpoint:
   experiment_tag: 'base-train-0'
   model_checkpoint_path: '/Users/sanujsharma/Research/nlp-rl/TextWorld/yertle/train_0_model'
-  load_pretrained: True  # during test, enable this so that the agent load your pretrained model
+  load_pretrained: False  # during test, enable this so that the agent load your pretrained model
   pretrained_experiment_tag: 'base-train-0_episode_16100'
   save_frequency: 100
 
@@ -31,7 +31,7 @@ training:
     clip_grad_norm: 5
 
 model:
-  embedding_size: 64
+  embedding_size: 768
   encoder_rnn_hidden_size: [192]
   action_scorer_hidden_dim: 128
   dropout_between_rnn_layers: 0.
