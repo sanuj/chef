@@ -15,12 +15,14 @@ from textworld import EnvInfos
 
 from model import LSTM_DQN
 from generic import to_np, to_pt, preproc, _words_to_ids, pad_sequences, max_len
+from extract_bert_features import BertFeatures
 
 
+Observation = namedtuple('Observation', ('description', 'inventory', 'feedback', 'prev_actions'))
 # a snapshot of state to be stored in replay memory
-Transition = namedtuple('Transition', ('observation_id_list', 'word_indices',
+Transition = namedtuple('Transition', ('observation', 'word_indices',
                                        'reward', 'mask', 'done',
-                                       'next_observation_id_list',
+                                       'next_observation',
                                        'next_word_masks'))
 
 
@@ -125,6 +127,8 @@ class CustomAgent:
                               word_vocab=self.word_vocab,
                               enable_cuda=self.use_cuda)
 
+        self.bert = BertFeatures('bert-base-uncased', torch.device('cuda' if self.use_cuda else 'cpu'))
+
         self.experiment_tag = self.config['checkpoint']['experiment_tag']
         self.model_checkpoint_path = self.config['checkpoint']['model_checkpoint_path']
         self.save_frequency = self.config['checkpoint']['save_frequency']
@@ -152,7 +156,7 @@ class CustomAgent:
         self.update_per_k_game_steps = self.config['general']['update_per_k_game_steps']
         self.clip_grad_norm = self.config['training']['optimizer']['clip_grad_norm']
 
-        self.nlp = spacy.load('en', disable=['ner', 'parser', 'tagger'])
+        self.nlp = spacy.load('en', disable=['ner', 'tagger'])
         self.preposition_map = {"take": "from",
                                 "chop": "with",
                                 "slice": "with",
@@ -167,6 +171,14 @@ class CustomAgent:
         self._epsiode_has_started = False
         self.history_avg_scores = HistoryScoreCache(capacity=1000)
         self.best_avg_score_so_far = 0.0
+
+    @property
+    def device(self):
+        if self.use_cuda:
+            # torch.cuda.set_device(self.args.gpu)
+            return torch.device('cuda')
+        else:
+            return torch.device('cpu')
 
     def train(self):
         """
@@ -318,7 +330,7 @@ class CustomAgent:
         second_adj_mask[:, self.EOS_id] = 1.0
         self.word_masks_np = [verb_mask, adj_mask, noun_mask, second_adj_mask, second_noun_mask]
 
-        self.cache_description_id_list = None
+        self.cache_batched_obs = None
         self.cache_chosen_indices = None
         self.current_step = 0
 
@@ -331,29 +343,18 @@ class CustomAgent:
             obs: Previous command's feedback for each game.
             infos: Additional information for each game.
         """
-        inventory_token_list = [preproc(item, tokenizer=self.nlp) for item in infos["inventory"]]
-        inventory_id_list = [_words_to_ids(tokens, self.word2id) for tokens in inventory_token_list]
+        sentence_len = 20
 
-        feedback_token_list = [preproc(item, str_type='feedback', tokenizer=self.nlp) for item in obs]
-        feedback_id_list = [_words_to_ids(tokens, self.word2id) for tokens in feedback_token_list]
+        def bert_inp(item, nlp=self.nlp): return self.bert.get_bert_inp(item, nlp, sentence_len)
 
-        quest_token_list = [preproc(item, tokenizer=self.nlp) for item in infos["extra.recipe"]]
-        quest_id_list = [_words_to_ids(tokens, self.word2id) for tokens in quest_token_list]
+        inventory_id_list = [bert_inp(preproc(item)) for item in infos["inventory"]]
+        feedback_id_list = [bert_inp(preproc(item, str_type='feedback')) for item in obs]
+        prev_action_id_list = [bert_inp(preproc(item)) for item in self.prev_actions]
+        description_id_list = [bert_inp(preproc(item)) for item in infos["description"]]
 
-        prev_action_token_list = [preproc(item, tokenizer=self.nlp) for item in self.prev_actions]
-        prev_action_id_list = [_words_to_ids(tokens, self.word2id) for tokens in prev_action_token_list]
+        batched_obs = [Observation(_d, _i, _f, _pa) for (_d, _i, _f, _pa) in zip(description_id_list, inventory_id_list, feedback_id_list, prev_action_id_list)]
 
-        description_token_list = [preproc(item, tokenizer=self.nlp) for item in infos["description"]]
-        for i, d in enumerate(description_token_list):
-            if len(d) == 0:
-                description_token_list[i] = ["end"]  # if empty description, insert word "end"
-        description_id_list = [_words_to_ids(tokens, self.word2id) for tokens in description_token_list]
-        description_id_list = [_d + _i + _q + _f + _pa for (_d, _i, _q, _f, _pa) in zip(description_id_list, inventory_id_list, quest_id_list, feedback_id_list, prev_action_id_list)]
-
-        input_description = pad_sequences(description_id_list, maxlen=max_len(description_id_list)).astype('int32')
-        input_description = to_pt(input_description, self.use_cuda)
-
-        return input_description, description_id_list
+        return batched_obs
 
     def word_ids_to_commands(self, verb, adj, noun, adj_2, noun_2):
         """
@@ -452,15 +453,24 @@ class CustomAgent:
         word_indices = [item.unsqueeze(-1) for item in word_indices]  # list of batch x 1
         return word_qvalues, word_indices
 
-    def get_ranks(self, input_description):
+    def get_ranks(self, batched_obs):
         """
         Given input description tensor, call model forward, to get Q values of words.
 
         Arguments:
-            input_description: Input tensors, which include all the information chosen in
+            batched_obs: Input tensors, which include all the information chosen in
             select_additional_infos() concatenated together.
         """
-        state_representation = self.model.representation_generator(input_description)
+        # batched BERT features
+        # batched_bf = []
+        # for obs in batched_obs:
+        #     bf = []
+        #     for o in obs:
+        #         bf.append(self.bert.extract_features(o))
+        #     batched_bf.append(torch.cat(bf))
+        bf = [torch.cat([self.bert.extract_features(o) for o in obs]) for obs in batched_obs]
+        batched_bf = torch.nn.utils.rnn.pad_sequence(bf, batch_first=True).to(self.device)
+        state_representation = self.model.representation_generator(batched_bf)
         word_ranks = self.model.action_scorer(state_representation)  # each element in list has batch x n_vocab size
         return word_ranks
 
@@ -495,8 +505,8 @@ class CustomAgent:
             self._end_episode(obs, scores, infos)
             return  # Nothing to return.
 
-        input_description, _ = self.get_game_step_info(obs, infos)
-        word_ranks = self.get_ranks(input_description)  # list of batch x vocab
+        batched_obs = self.get_game_step_info(obs, infos)
+        word_ranks = self.get_ranks(batched_obs)  # list of batch x vocab
         _, word_indices_maxq = self.choose_maxQ_command(word_ranks, self.word_masks_np)
 
         chosen_indices = word_indices_maxq
@@ -541,14 +551,14 @@ class CustomAgent:
             # compute previous step's rewards and masks
             rewards_np, rewards, mask_np, mask = self.compute_reward()
 
-        input_description, description_id_list = self.get_game_step_info(obs, infos)
+        batched_obs = self.get_game_step_info(obs, infos)
         # generate commands for one game step, epsilon greedy is applied, i.e.,
         # there is epsilon of chance to generate random commands
-        word_ranks = self.get_ranks(input_description)  # list of batch x vocab
+        word_ranks = self.get_ranks(batched_obs)  # list of batch x vocab
         _, word_indices_maxq = self.choose_maxQ_command(word_ranks, self.word_masks_np)
         _, word_indices_random = self.choose_random_command(word_ranks, self.word_masks_np)
         # random number for epsilon greedy
-        rand_num = np.random.uniform(low=0.0, high=1.0, size=(input_description.size(0), 1))
+        rand_num = np.random.uniform(low=0.0, high=1.0, size=(len(batched_obs), 1))
         less_than_epsilon = (rand_num < self.epsilon).astype("float32")  # batch
         greater_than_epsilon = 1.0 - less_than_epsilon
         less_than_epsilon = to_pt(less_than_epsilon, self.use_cuda, type='float')
@@ -566,10 +576,10 @@ class CustomAgent:
                 if mask_np[b] == 0:
                     continue
                 is_prior = rewards_np[b] > 0.0
-                self.replay_memory.push(is_prior, self.cache_description_id_list[b], [item[b] for item in self.cache_chosen_indices], rewards[b], mask[b], dones[b], description_id_list[b], [item[b] for item in self.word_masks_np])
+                self.replay_memory.push(is_prior, self.cache_batched_obs[b], [item[b] for item in self.cache_chosen_indices], rewards[b], mask[b], dones[b], batched_obs[b], [item[b] for item in self.word_masks_np])
 
         # cache new info in current game step into caches
-        self.cache_description_id_list = description_id_list
+        self.cache_batched_obs = batched_obs
         self.cache_chosen_indices = chosen_indices
 
         # update neural model by replaying snapshots in replay memory
@@ -584,7 +594,7 @@ class CustomAgent:
                 self.optimizer.step()  # apply gradients
 
         self.current_step += 1
-        
+
         if all(dones):
             self._end_episode(obs, scores, infos)
             return  # Nothing to return.
@@ -627,18 +637,14 @@ class CustomAgent:
         transitions = self.replay_memory.sample(self.replay_batch_size)
         batch = Transition(*zip(*transitions))
 
-        observation_id_list = pad_sequences(batch.observation_id_list, maxlen=max_len(batch.observation_id_list)).astype('int32')
-        input_observation = to_pt(observation_id_list, self.use_cuda)
-        next_observation_id_list = pad_sequences(batch.next_observation_id_list, maxlen=max_len(batch.next_observation_id_list)).astype('int32')
-        next_input_observation = to_pt(next_observation_id_list, self.use_cuda)
         chosen_indices = list(list(zip(*batch.word_indices)))
         chosen_indices = [torch.stack(item, 0) for item in chosen_indices]  # list of batch x 1
 
-        word_ranks = self.get_ranks(input_observation)  # list of batch x vocab
+        word_ranks = self.get_ranks(batch.observation)  # list of batch x vocab
         word_qvalues = [w_rank.gather(1, idx).squeeze(-1) for w_rank, idx in zip(word_ranks, chosen_indices)]  # list of batch
         q_value = torch.mean(torch.stack(word_qvalues, -1), -1)  # batch
 
-        next_word_ranks = self.get_ranks(next_input_observation)  # batch x n_verb, batch x n_noun, batchx n_second_noun
+        next_word_ranks = self.get_ranks(batch.next_observation)  # batch x n_verb, batch x n_noun, batchx n_second_noun
         next_word_masks = list(list(zip(*batch.next_word_masks)))
         next_word_masks = [np.stack(item, 0) for item in next_word_masks]
         next_word_qvalues, _ = self.choose_maxQ_command(next_word_ranks, next_word_masks)

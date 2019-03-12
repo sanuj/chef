@@ -32,12 +32,12 @@ def _words_to_ids(words, word2id):
     return ids
 
 
-def preproc(s, str_type='None', tokenizer=None, lower_case=True):
+def preproc(s, str_type='None'):
     if s is None:
-        return ["nothing"]
+        return ""
     s = s.replace("\n", ' ')
     if s.strip() == "":
-        return ["nothing"]
+        return ""
     if str_type == 'feedback':
         if "$$$$$$$" in s:
             s = ""
@@ -45,11 +45,8 @@ def preproc(s, str_type='None', tokenizer=None, lower_case=True):
             s = s.split("-=")[0]
     s = s.strip()
     if len(s) == 0:
-        return ["nothing"]
-    tokens = [t.text for t in tokenizer(s)]
-    if lower_case:
-        tokens = [t.lower() for t in tokens]
-    return tokens
+        return ""
+    return s
 
 
 def max_len(list_of_list):

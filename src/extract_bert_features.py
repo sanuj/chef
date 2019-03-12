@@ -38,6 +38,30 @@ class InputFeatures(object):
         self.input_type_ids = input_type_ids
 
 
+BertInput = collections.namedtuple('BertInput', ('token_ids', 'mask'))
+
+
+class BertFeatures(object):
+
+    def __init__(self, bert_model, device):
+        self.device = device
+        self.tokenizer = BertTokenizer.from_pretrained(bert_model, do_lower_case=True)
+        self.model = BertModel.from_pretrained(bert_model)
+        self.model.to(device)
+
+    def get_bert_inp(self, paragraph, nlp, max_len):
+        tokens = [["[CLS]"] + self.tokenizer.tokenize(s.text.lower())[0:max_len-2] + ["[SEP]"] for s in nlp(paragraph).sents]
+        if len(tokens) == 0:
+            tokens = [["[CLS]", "[SEP]"]]
+        ids = [self.tokenizer.convert_tokens_to_ids(tks) + [0]*(max_len-len(tks)) for tks in tokens]
+        mask = [[1]*len(tks) + [0]*(max_len-len(tks)) for tks in tokens]
+        return BertInput(torch.LongTensor(ids).to(self.device), torch.LongTensor(mask).to(self.device))
+
+    def extract_features(self, input):
+        encoder_layers, pooled_output = self.model(input.token_ids, token_type_ids=None, attention_mask=input.mask)
+        return pooled_output
+
+
 def convert_examples_to_features(examples, seq_length, tokenizer):
     """Loads a data file into a list of `InputBatch`s."""
 

@@ -67,9 +67,13 @@ class LSTM_DQN(torch.nn.Module):
             torch.nn.init.xavier_uniform_(self.action_scorers[i].weight.data)
         self.action_scorer_shared.bias.data.fill_(0)
 
-    def representation_generator(self, _input_words):
-        embeddings, mask = self.word_embedding.forward(_input_words)  # batch x time x emb
-        encoding_sequence, _, _ = self.encoder.forward(embeddings, mask)  # batch x time x h
+    def compute_mask(self, x):
+        mask = torch.ne(x[:, :, 0], 0).float()
+        return mask.cuda() if self.enable_cuda else mask
+
+    def representation_generator(self, bf_sents):
+        mask = self.compute_mask(bf_sents)
+        encoding_sequence, _, _ = self.encoder.forward(bf_sents, mask)  # batch x time x h
         mean_encoding = masked_mean(encoding_sequence, mask)  # batch x h
         return mean_encoding
 
