@@ -55,11 +55,13 @@ class BertFeatures(object):
             tokens = [["[CLS]", "[SEP]"]]
         ids = [self.tokenizer.convert_tokens_to_ids(tks) + [0]*(max_len-len(tks)) for tks in tokens]
         mask = [[1]*len(tks) + [0]*(max_len-len(tks)) for tks in tokens]
-        return BertInput(torch.LongTensor(ids).to(self.device), torch.LongTensor(mask).to(self.device))
+        return BertInput(ids, mask)
 
-    def extract_features(self, input):
-        encoder_layers, pooled_output = self.model(input.token_ids, token_type_ids=None, attention_mask=input.mask)
-        return pooled_output
+    def extract_features(self, inp):
+        with torch.no_grad():
+            encoder_layers, pooled_output = self.model(torch.LongTensor(inp.token_ids).to(self.device), token_type_ids=None,
+                                                       attention_mask=torch.LongTensor(inp.mask).to(self.device))
+            return pooled_output
 
 
 def convert_examples_to_features(examples, seq_length, tokenizer):
