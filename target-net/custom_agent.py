@@ -121,9 +121,14 @@ class CustomAgent:
         else:
             self.use_cuda = False
 
-        self.model = LSTM_DQN(model_config=self.config["model"],
+        self.policy_net = LSTM_DQN(model_config=self.config["model"],
                               word_vocab=self.word_vocab,
                               enable_cuda=self.use_cuda)
+        self.target_net = LSTM_DQN(model_config=self.config["model"],
+                                   word_vocab=self.word_vocab,
+                                   enable_cuda=self.use_cuda)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
 
         self.experiment_tag = self.config['checkpoint']['experiment_tag']
         self.model_checkpoint_path = self.config['checkpoint']['model_checkpoint_path']
@@ -134,14 +139,15 @@ class CustomAgent:
         if self.config['checkpoint']['load_pretrained']:
             self.load_pretrained_model(self.model_checkpoint_path + '/' + self.config['checkpoint']['pretrained_experiment_tag'] + '.pt')
         if self.use_cuda:
-            self.model.cuda()
+            self.policy_net.cuda()
+            self.target_net.cuda()
 
         self.replay_batch_size = self.config['general']['replay_batch_size']
         self.replay_memory = PrioritizedReplayMemory(self.config['general']['replay_memory_capacity'],
                                                      priority_fraction=self.config['general']['replay_memory_priority_fraction'])
 
         # optimizer
-        parameters = filter(lambda p: p.requires_grad, self.model.parameters())
+        parameters = filter(lambda p: p.requires_grad, self.policy_net.parameters())
         self.optimizer = torch.optim.Adam(parameters, lr=self.config['training']['optimizer']['learning_rate'])
 
         # epsilon greedy
@@ -162,6 +168,7 @@ class CustomAgent:
                                 "put": "on"}
         self.single_word_verbs = set(["inventory", "look"])
         self.discount_gamma = self.config['general']['discount_gamma']
+        self.target_net_update = self.config['general']['target_net_update']
         self.current_episode = 0
         self.current_step = 0
         self._epsiode_has_started = False
@@ -173,14 +180,14 @@ class CustomAgent:
         Tell the agent that it's training phase.
         """
         self.mode = "train"
-        self.model.train()
+        self.policy_net.train()
 
     def eval(self):
         """
         Tell the agent that it's evaluation phase.
         """
         self.mode = "eval"
-        self.model.eval()
+        self.policy_net.eval()
 
     def _start_episode(self, obs: List[str], infos: Dict[str, List[Any]]) -> None:
         """
@@ -218,7 +225,7 @@ class CustomAgent:
                 state_dict = torch.load(load_from)
             else:
                 state_dict = torch.load(load_from, map_location='cpu')
-            self.model.load_state_dict(state_dict)
+            self.policy_net.load_state_dict(state_dict)
         except:
             print("Failed to load checkpoint...")
 
@@ -452,18 +459,6 @@ class CustomAgent:
         word_indices = [item.unsqueeze(-1) for item in word_indices]  # list of batch x 1
         return word_qvalues, word_indices
 
-    def get_ranks(self, input_description):
-        """
-        Given input description tensor, call model forward, to get Q values of words.
-
-        Arguments:
-            input_description: Input tensors, which include all the information chosen in
-            select_additional_infos() concatenated together.
-        """
-        state_representation = self.model.representation_generator(input_description)
-        word_ranks = self.model.action_scorer(state_representation)  # each element in list has batch x n_vocab size
-        return word_ranks
-
     def act_eval(self, obs: List[str], scores: List[int], dones: List[bool], infos: Dict[str, List[Any]]) -> List[str]:
         """
         Acts upon the current list of observations, during evaluation.
@@ -496,7 +491,8 @@ class CustomAgent:
             return  # Nothing to return.
 
         input_description, _ = self.get_game_step_info(obs, infos)
-        word_ranks = self.get_ranks(input_description)  # list of batch x vocab
+        with torch.no_grad():
+            word_ranks = self.policy_net.get_ranks(input_description)  # list of batch x vocab
         _, word_indices_maxq = self.choose_maxQ_command(word_ranks, self.word_masks_np)
 
         chosen_indices = word_indices_maxq
@@ -544,7 +540,8 @@ class CustomAgent:
         input_description, description_id_list = self.get_game_step_info(obs, infos)
         # generate commands for one game step, epsilon greedy is applied, i.e.,
         # there is epsilon of chance to generate random commands
-        word_ranks = self.get_ranks(input_description)  # list of batch x vocab
+        with torch.no_grad():
+            word_ranks = self.policy_net.get_ranks(input_description)  # list of batch x vocab
         _, word_indices_maxq = self.choose_maxQ_command(word_ranks, self.word_masks_np)
         _, word_indices_random = self.choose_random_command(word_ranks, self.word_masks_np)
         # random number for epsilon greedy
@@ -580,7 +577,7 @@ class CustomAgent:
                 self.optimizer.zero_grad()
                 loss.backward(retain_graph=True)
                 # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.clip_grad_norm)
                 self.optimizer.step()  # apply gradients
 
         self.current_step += 1
@@ -634,11 +631,12 @@ class CustomAgent:
         chosen_indices = list(list(zip(*batch.word_indices)))
         chosen_indices = [torch.stack(item, 0) for item in chosen_indices]  # list of batch x 1
 
-        word_ranks = self.get_ranks(input_observation)  # list of batch x vocab
+        word_ranks = self.policy_net.get_ranks(input_observation)  # list of batch x vocab
         word_qvalues = [w_rank.gather(1, idx).squeeze(-1) for w_rank, idx in zip(word_ranks, chosen_indices)]  # list of batch
         q_value = torch.mean(torch.stack(word_qvalues, -1), -1)  # batch
 
-        next_word_ranks = self.get_ranks(next_input_observation)  # batch x n_verb, batch x n_noun, batchx n_second_noun
+        with torch.no_grad():
+            next_word_ranks = self.target_net.get_ranks(next_input_observation)  # batch x n_verb, batch x n_noun, batchx n_second_noun
         next_word_masks = list(list(zip(*batch.next_word_masks)))
         next_word_masks = [np.stack(item, 0) for item in next_word_masks]
         next_word_qvalues, _ = self.choose_maxQ_command(next_word_ranks, next_word_masks)
@@ -677,10 +675,14 @@ class CustomAgent:
                 self.best_avg_score_so_far = avg_score
 
                 save_to = self.model_checkpoint_path + '/' + self.experiment_tag + "_episode_" + str(self.current_episode) + ".pt"
-                torch.save(self.model.state_dict(), save_to)
+                torch.save(self.policy_net.state_dict(), save_to)
                 print("========= saved checkpoint =========")
 
         self.current_episode += 1
+        # update target net with policy net
+        if self.current_episode % self.target_net_update == 0:
+            print("Updating target_net.")
+            self.target_net.load_state_dict(self.policy_net.state_dict())
         # annealing
         if self.current_episode < self.epsilon_anneal_episodes:
             self.epsilon -= (self.epsilon_anneal_from - self.epsilon_anneal_to) / float(self.epsilon_anneal_episodes)
