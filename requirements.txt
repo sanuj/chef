@@ -7,5 +7,7 @@ spacy
 torch
 visdom
 pytorch-pretrained-bert
-chromedriver_installer --install-options="--chromedriver-version=2.46"
+#chromedriver_installer --install-options="--chromedriver-version=2.46"
+embeddings
+logging
 
