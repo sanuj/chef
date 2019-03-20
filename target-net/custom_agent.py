@@ -681,7 +681,7 @@ class CustomAgent:
         self.current_episode += 1
         # update target net with policy net
         if self.current_episode % self.target_net_update == 0:
-            print("Updating target_net.")
+            #print("Updating target_net.")
             self.target_net.load_state_dict(self.policy_net.state_dict())
         # annealing
         if self.current_episode < self.epsilon_anneal_episodes:
